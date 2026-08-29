@@ -17,7 +17,7 @@ def get_current_time_str():
 def get_current_datetime_str():
     return datetime.now(TZ_LOCAL).strftime("%Y-%m-%d %H:%M")
 
-# 1. Base de datos SQLite con respaldo persistente
+# 1. Base de datos SQLite
 def get_db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -59,19 +59,16 @@ def init_db():
         )
     ''')
     
-    # Crear cuenta Administrador por defecto si no existe
     now_str = get_current_datetime_str()
     cursor.execute('''
         INSERT OR IGNORE INTO users (username, password, role, created_at, last_active)
         VALUES ('administrador', 'admin', 'Admin', ?, 0)
     ''', (now_str,))
     
-    # Crear sala GENERAL por defecto
     cursor.execute("INSERT OR IGNORE INTO rooms (room_code, created_by, created_at) VALUES ('GENERAL', 'Sistema', ?)", (now_str,))
     conn.commit()
     conn.close()
     
-    # Restaurar datos desde el backup si el servidor se reinició
     restore_from_backup()
 
 def save_to_backup():
@@ -118,14 +115,14 @@ def restore_from_backup():
 
 init_db()
 
-# 2. Consultas y Gestión
-def get_all_rooms():
+# 2. Consultas
+def get_all_room_names():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute('SELECT room_code, created_by, created_at FROM rooms ORDER BY created_at DESC')
+    cursor.execute('SELECT room_code FROM rooms ORDER BY created_at DESC')
     rows = cursor.fetchall()
     conn.close()
-    return rows
+    return [r[0] for r in rows] if rows else ["GENERAL"]
 
 def get_all_users_admin():
     conn = get_db()
@@ -152,24 +149,25 @@ def get_deletable_users_list():
 
 def create_new_room(new_room_name, username):
     room = new_room_name.strip().upper().replace(" ", "_")
+    rooms = get_all_room_names()
     if not room:
-        return "⚠️ Escribe un nombre para la sala.", gr.update()
+        return "⚠️ Escribe un nombre para la sala.", gr.Radio(choices=rooms, value=rooms[0] if rooms else None)
     
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute('SELECT room_code FROM rooms WHERE room_code = ?', (room,))
     if cursor.fetchone():
         conn.close()
-        return f"ℹ️ La sala **{room}** ya existe.", gr.update()
+        return f"ℹ️ La sala **{room}** ya existe.", gr.Radio(choices=rooms, value=room)
     
     now = get_current_datetime_str()
-    cursor.execute('INSERT INTO rooms (room_code, created_by, created_at) VALUES (?, ?, ?)', (room, username, now))
+    cursor.execute('INSERT INTO rooms (room_code, created_by, created_at) VALUES (?, ?, ?)', (room, username or 'Sistema', now))
     conn.commit()
     conn.close()
     save_to_backup()
     
-    rooms = [r[0] for r in get_all_rooms()]
-    return f"✅ Sala **{room}** creada exitosamente.", gr.update(choices=rooms, value=room)
+    updated_rooms = get_all_room_names()
+    return f"✅ Sala **{room}** creada exitosamente.", gr.Radio(choices=updated_rooms, value=room)
 
 # 3. Autenticación
 def auth_user(username_raw, password_raw, action_type):
@@ -220,9 +218,10 @@ def auth_user(username_raw, password_raw, action_type):
         save_to_backup()
         user_role = "Usuario"
     
-    rooms = [r[0] for r in get_all_rooms()]
+    rooms = get_all_room_names()
     admin_table = get_all_users_admin() if user_role == "Admin" else []
     admin_del_choices = get_deletable_users_list() if user_role == "Admin" else []
+    default_room = rooms[0] if rooms else "GENERAL"
     
     return (
         f"✅ Bienvenido, **{username}**",
@@ -231,15 +230,15 @@ def auth_user(username_raw, password_raw, action_type):
         gr.update(visible=(user_role == "Admin")),
         username,
         user_role,
-        gr.update(choices=rooms, value=rooms[0] if rooms else "GENERAL"),
+        gr.Radio(choices=rooms, value=default_room),
         admin_table,
-        gr.update(choices=admin_del_choices, value=admin_del_choices[0] if admin_del_choices else None)
+        gr.Dropdown(choices=admin_del_choices, value=admin_del_choices[0] if admin_del_choices else None)
     )
 
-# 4. Sincronización en Vivo y Formato de Mensajes WhatsApp
+# 4. Sincronización y Chat
 def sync_room_live(room_code, username, role):
-    if not username:
-        return "", "", [], []
+    if not username or not room_code:
+        return gr.update(), gr.update(), gr.update(), gr.update()
     
     current_time = time.time()
     conn = get_db()
@@ -247,21 +246,17 @@ def sync_room_live(room_code, username, role):
     
     cursor.execute('UPDATE users SET last_active = ? WHERE username = ?', (current_time, username))
     
-    if room_code:
-        cursor.execute('''
-            INSERT INTO presence (room_code, username, last_seen) VALUES (?, ?, ?)
-            ON CONFLICT(room_code, username) DO UPDATE SET last_seen = excluded.last_seen
-        ''', (room_code, username, current_time))
-        conn.commit()
-        
-        cursor.execute('SELECT username, last_seen FROM presence WHERE room_code = ?', (room_code,))
-        user_rows = cursor.fetchall()
-        
-        cursor.execute('SELECT author, text, timestamp FROM messages WHERE room_code = ? ORDER BY id ASC', (room_code,))
-        msg_rows = cursor.fetchall()
-    else:
-        user_rows, msg_rows = [], []
-        
+    cursor.execute('''
+        INSERT INTO presence (room_code, username, last_seen) VALUES (?, ?, ?)
+        ON CONFLICT(room_code, username) DO UPDATE SET last_seen = excluded.last_seen
+    ''', (room_code, username, current_time))
+    conn.commit()
+    
+    cursor.execute('SELECT username, last_seen FROM presence WHERE room_code = ?', (room_code,))
+    user_rows = cursor.fetchall()
+    
+    cursor.execute('SELECT author, text, timestamp FROM messages WHERE room_code = ? ORDER BY id ASC', (room_code,))
+    msg_rows = cursor.fetchall()
     conn.close()
     
     users_status = []
@@ -273,15 +268,12 @@ def sync_room_live(room_code, username, role):
     chat_header = f"### 👤 Usuario: **{username}** &nbsp;&nbsp;|&nbsp;&nbsp; 🚪 Sala: **{room_code}**"
     presence_text = "**Participantes:** " + (" • ".join(users_status) if users_status else "*Sin miembros activos*")
     
-    # Formateo de burbuja estilo WhatsApp
     chat_history = []
     for author, text, timestamp in msg_rows:
         if author == username:
-            # Mensaje propio (Derecha con hora discreta e icono)
             content = f"{text}\n\n<div class='msg-time msg-time-right'>{timestamp} ✓✓</div>"
             chat_history.append({"role": "user", "content": content})
         else:
-            # Mensaje recibido (Izquierda con autor destacado)
             content = f"<span class='msg-author'>{author}</span>\n\n{text}\n\n<div class='msg-time'>{timestamp}</div>"
             chat_history.append({"role": "assistant", "content": content})
             
@@ -294,7 +286,7 @@ def send_msg(room_code, username, text, role):
         _, _, chat_hist, _ = sync_room_live(room_code, username, role)
         return chat_hist, ""
     
-    timestamp = get_current_time_str() # Hora exacta compacta ej: 18:40
+    timestamp = get_current_time_str()
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -316,10 +308,10 @@ def leave_current_room(room_code, username, role):
         conn.commit()
         conn.close()
     
-    rooms = [r[0] for r in get_all_rooms()]
+    rooms = get_all_room_names()
     admin_t = get_all_users_admin() if role == "Admin" else []
     admin_del_choices = get_deletable_users_list() if role == "Admin" else []
-    return "", gr.update(visible=True), gr.update(visible=False), gr.update(choices=rooms), admin_t, [], gr.update(choices=admin_del_choices)
+    return "", gr.update(visible=True), gr.update(visible=False), gr.Radio(choices=rooms, value=rooms[0] if rooms else None), admin_t, [], gr.Dropdown(choices=admin_del_choices)
 
 def clear_room_history(room_code, username, role):
     if room_code:
@@ -361,66 +353,22 @@ def admin_delete_user(target_user):
     
     updated_users = get_deletable_users_list()
     updated_table = get_all_users_admin()
-    return f"✅ Cuenta **{target_user}** eliminada definitivamente.", gr.update(choices=updated_users, value=updated_users[0] if updated_users else None), updated_table
+    return f"✅ Cuenta **{target_user}** eliminada definitivamente.", gr.Dropdown(choices=updated_users, value=updated_users[0] if updated_users else None), updated_table
 
-# 5. Estilos Visuales (CSS WhatsApp Style)
+# 5. Estilos
 custom_css = """
-.auth-box {
-    max-width: 480px;
-    margin: 40px auto;
-    padding: 28px;
-    border-radius: 16px;
-    background: #ffffff;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.06);
-}
-.room-selector-card {
-    padding: 20px;
-    border: 2px solid #0d9488;
-    border-radius: 14px;
-    background: #f0fdfa;
-}
-.admin-card {
-    padding: 16px;
-    border-radius: 12px;
-    background: #f8fafc;
-    border: 1px solid #cbd5e1;
-    margin-bottom: 16px;
-}
-.danger-box {
-    margin-top: 24px;
-    padding: 16px;
-    border: 1px dashed #ef4444;
-    border-radius: 12px;
-    background: #fef2f2;
-}
-/* Estilo WhatsApp para la hora dentro de las burbujas */
-.msg-author {
-    font-weight: 700;
-    color: #0f766e;
-    display: block;
-    margin-bottom: 2px;
-    font-size: 0.95rem;
-}
-.msg-time {
-    font-size: 0.72rem;
-    color: #64748b;
-    text-align: right;
-    margin-top: 4px;
-    line-height: 1;
-}
-.msg-time-right {
-    color: #047857;
-}
+.auth-box { max-width: 480px; margin: 40px auto; padding: 28px; border-radius: 16px; background: #ffffff; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+.room-selector-card { padding: 20px; border: 2px solid #0d9488; border-radius: 14px; background: #f0fdfa; }
+.admin-card { padding: 16px; border-radius: 12px; background: #f8fafc; border: 1px solid #cbd5e1; margin-bottom: 16px; }
+.danger-box { margin-top: 24px; padding: 16px; border: 1px dashed #ef4444; border-radius: 12px; background: #fef2f2; }
+.msg-author { font-weight: 700; color: #0f766e; display: block; margin-bottom: 2px; font-size: 0.95rem; }
+.msg-time { font-size: 0.72rem; color: #64748b; text-align: right; margin-top: 4px; line-height: 1; }
+.msg-time-right { color: #047857; }
 """
 
-theme = gr.themes.Soft(
-    primary_hue="teal",
-    secondary_hue="slate",
-    neutral_hue="slate",
-    radius_size="lg"
-)
+theme = gr.themes.Soft(primary_hue="teal", secondary_hue="slate", neutral_hue="slate", radius_size="lg")
 
-# 6. Interfaz Principal
+# 6. Interfaz
 with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
     session_user = gr.State("")
     session_role = gr.State("Usuario")
@@ -440,7 +388,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
             
         login_status = gr.Markdown("")
 
-    # VISTA 2: PANEL DE SALAS (HUB)
+    # VISTA 2: HUB
     with gr.Group(visible=False) as hub_view:
         with gr.Row():
             hub_title = gr.Markdown("## 🏢 Centro de Salas")
@@ -461,7 +409,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         with gr.Row():
             with gr.Column(scale=2, elem_classes=["room-selector-card"]):
                 gr.Markdown("### 📂 Selecciona una Sala:")
-                room_picker = gr.Radio(label="Salas disponibles", choices=[], value=None)
+                room_picker = gr.Radio(label="Salas disponibles", choices=["GENERAL"], value="GENERAL")
                 btn_enter = gr.Button("🚀 Entrar a la Sala", variant="primary", size="lg")
             
             with gr.Column(scale=1):
@@ -476,7 +424,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
                 gr.Markdown("Si deseas dar de baja tu usuario y borrar tus accesos:")
                 btn_delete_own = gr.Button("🗑️ Eliminar Mi Cuenta", variant="stop", scale=1)
 
-    # VISTA 3: SALA DE CHAT EN VIVO
+    # VISTA 3: SALA EN VIVO
     with gr.Group(visible=False) as chat_view:
         with gr.Row():
             chat_info_header = gr.Markdown("### 👤 Usuario: ... | 🚪 Sala: ...", scale=3)
@@ -492,7 +440,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
             
         btn_clear = gr.Button("🗑️ Vaciar Historial de esta Sala", variant="stop")
 
-    # Sincronizador Automático (cada 2 segundos)
+    # Sincronizador Automático
     refresh_timer = gr.Timer(value=2)
     refresh_timer.tick(
         sync_room_live,
@@ -500,7 +448,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[chat_info_header, presence_bar, chatbot, admin_users_table]
     )
 
-    # Handlers Autenticación
+    # Handlers Login / Registro
     btn_login.click(
         lambda u, p: auth_user(u, p, "login"),
         inputs=[user_input, pass_input],
@@ -512,7 +460,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[login_status, login_view, hub_view, admin_panel, session_user, session_role, room_picker, admin_users_table, admin_select_user_del]
     )
 
-    # Handler Cerrar Sesión
+    # Logout
     def logout_action():
         return "", gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), "", "Usuario", "", []
     
@@ -525,17 +473,17 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[login_status, login_view, hub_view, chat_view, session_user, session_role, session_room, chatbot]
     )
 
-    # Handler Salir de la Sala
+    # Salir de Sala
     btn_leave_room.click(
         leave_current_room,
         inputs=[session_room, session_user, session_role],
         outputs=[session_room, hub_view, chat_view, room_picker, admin_users_table, chatbot, admin_select_user_del]
     )
 
-    # Handler Crear Sala
+    # Crear Sala
     def handle_create(name, user):
-        msg, update_picker = create_new_room(name, user)
-        return msg, "", update_picker
+        msg, picker_update = create_new_room(name, user)
+        return msg, "", picker_update
     
     btn_create.click(
         handle_create,
@@ -543,12 +491,11 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[create_status, new_room_txt, room_picker]
     )
 
-    # Handler Entrar a Sala
+    # Entrar a Sala
     def enter_room_action(room, user, role):
-        if not room:
-            return "", gr.update(), gr.update(), "", "", []
-        h, p, m, _ = sync_room_live(room, user, role)
-        return room, gr.update(visible=False), gr.update(visible=True), h, p, m
+        target_room = room or "GENERAL"
+        h, p, m, _ = sync_room_live(target_room, user, role)
+        return target_room, gr.update(visible=False), gr.update(visible=True), h, p, m
     
     btn_enter.click(
         enter_room_action,
@@ -556,7 +503,7 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[session_room, hub_view, chat_view, chat_info_header, presence_bar, chatbot]
     )
 
-    # Handlers para Eliminación de Cuentas
+    # Eliminaciones
     btn_delete_own.click(
         delete_own_account,
         inputs=[session_user],
@@ -569,12 +516,11 @@ with gr.Blocks(title="Chat en Red", theme=theme, css=custom_css) as demo:
         outputs=[admin_del_status, admin_select_user_del, admin_users_table]
     )
 
-    # Handlers Mensajería y Limpieza
+    # Mensajería
     btn_send.click(send_msg, inputs=[session_room, session_user, msg_input, session_role], outputs=[chatbot, msg_input])
     msg_input.submit(send_msg, inputs=[session_room, session_user, msg_input, session_role], outputs=[chatbot, msg_input])
     btn_clear.click(clear_room_history, inputs=[session_room, session_user, session_role], outputs=[chat_info_header, presence_bar, chatbot])
 
-# Puerto para Render
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port)
